@@ -1,6 +1,6 @@
 """
 COINDCX FUTURES TRADING BOT + TELEGRAM
-Uses CoinDCX Derivatives/Futures API
+Fixed: correct symbol format B-BTC_USDT, correct balance endpoint
 """
 import hashlib
 import hmac
@@ -23,14 +23,14 @@ RISK_PERC  = 0.10
 BOT_ACTIVE = True
 
 # ─── SYMBOL FORMAT ───────────────────────────────────────────────────────────
-# CoinDCX Futures symbol format: BTCUSDTPERP
 def to_futures_symbol(symbol: str) -> str:
+    # BTCUSDT → B-BTC_USDT
     symbol = symbol.upper().replace("-", "").replace("_", "")
-    if not symbol.endswith("PERP"):
-        symbol = symbol + "PERP"
+    for quote in ["USDT", "INR", "BTC", "ETH"]:
+        if symbol.endswith(quote):
+            base = symbol[: -len(quote)]
+            return f"B-{base}_{quote}"
     return symbol
-# "BTCUSDT" → "BTCUSDTPERP"
-# "ETHUSDT" → "ETHUSDTPERP"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -78,40 +78,24 @@ def send_telegram(message: str) -> bool:
         log.error(f"Telegram exception: {e}")
         return False
 
-# ─── COINDCX FUTURES API ──────────────────────────────────────────────────────
+# ─── COINDCX API ─────────────────────────────────────────────────────────────
 def get_balance() -> float:
-    """
-    POST /exchange/v1/derivatives/futures/user/balances
-    Returns available USDT margin balance
-    """
     try:
         payload = {"timestamp": int(time.time() * 1000)}
         body    = json.dumps(payload, separators=(",", ":"))
         r = requests.post(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/user/balances",
+            f"{BASE_URL}/exchange/v1/users/balances",
             headers=make_headers(body),
             data=body,
             timeout=10
         )
-        log.info(f"Balance RAW: {r.text}")
+        log.info(f"Balance RAW: {r.text[:300]}")
         data = r.json()
-        # Try list format
         if isinstance(data, list):
             for asset in data:
-                currency = asset.get("currency_short_name", "").upper()
-                if currency == "USDT":
-                    for field in ["available_balance", "balance", "available", "free"]:
-                        val = asset.get(field)
-                        if val is not None:
-                            return float(val)
-        # Try dict format
-        if isinstance(data, dict):
-            balance_data = data.get("data", data)
-            for field in ["available_balance", "balance", "available", "free", "usdt_balance"]:
-                val = balance_data.get(field)
-                if val is not None:
-                    return float(val)
-        log.error(f"Balance not found: {data}")
+                if asset.get("currency", "").upper() == "USDT":
+                    return float(asset.get("balance", 0))
+        log.error(f"USDT not found in balance: {data}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance error: {e}")
@@ -119,46 +103,21 @@ def get_balance() -> float:
 
 
 def get_price(symbol: str) -> float:
-    """
-    GET /exchange/v1/derivatives/futures/data/ticker
-    symbol = BTCUSDTPERP
-    """
+    # symbol = B-BTC_USDT
     try:
-        r = requests.get(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/data/ticker",
-            timeout=10
-        )
-        log.info(f"Ticker status: {r.status_code}")
+        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
         tickers = r.json()
-        # tickers can be list or dict
         if isinstance(tickers, list):
             for t in tickers:
-                mkt = t.get("market", t.get("symbol", "")).upper()
-                if mkt == symbol.upper():
-                    for field in ["last_price", "lastPrice", "last", "close"]:
-                        val = t.get(field)
-                        if val:
-                            return float(val)
-        if isinstance(tickers, dict):
-            data = tickers.get("data", tickers)
-            if isinstance(data, list):
-                for t in data:
-                    mkt = t.get("market", t.get("symbol", "")).upper()
-                    if mkt == symbol.upper():
-                        for field in ["last_price", "lastPrice", "last", "close"]:
-                            val = t.get(field)
-                            if val:
-                                return float(val)
-        raise ValueError(f"No futures ticker for {symbol}")
+                if t.get("market", "").upper() == symbol.upper():
+                    return float(t["last_price"])
+        raise ValueError(f"Symbol {symbol} not found in ticker")
     except Exception as e:
         log.error(f"get_price error: {e}")
         raise
 
 
 def set_leverage(symbol: str, leverage: int):
-    """
-    POST /exchange/v1/derivatives/futures/user/leverage
-    """
     try:
         payload = {
             "symbol"    : symbol,
@@ -178,11 +137,6 @@ def set_leverage(symbol: str, leverage: int):
 
 
 def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
-    """
-    POST /exchange/v1/derivatives/futures/orders/create
-    side = 'buy' or 'sell'
-    order_type = 'market_order'
-    """
     payload = {
         "market"            : symbol,
         "order_type"        : "market_order",
@@ -195,7 +149,7 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
         "timestamp"         : int(time.time() * 1000),
     }
     body = json.dumps(payload, separators=(",", ":"))
-    log.info(f"Placing futures order: {body}")
+    log.info(f"Placing order: {body}")
     r = requests.post(
         f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create",
         headers=make_headers(body),
@@ -226,7 +180,7 @@ def execute_trade(symbol: str, action: str) -> dict:
     if not BOT_ACTIVE:
         return {"status": "blocked", "reason": "Bot stopped"}
 
-    futures_symbol = to_futures_symbol(symbol)   # BTCUSDT → BTCUSDTPERP
+    futures_symbol = to_futures_symbol(symbol)    # BTCUSDT → B-BTC_USDT
     price          = get_price(futures_symbol)
     balance        = get_balance()
     log.info(f"Trade: {action} {futures_symbol} price={price} balance={balance}")
@@ -250,7 +204,6 @@ def execute_trade(symbol: str, action: str) -> dict:
     set_leverage(futures_symbol, LEVERAGE)
     result = place_order(futures_symbol, side, qty, tp, sl)
 
-    # Check for error
     if isinstance(result, dict) and result.get("code") not in (None, 0, 200, "200"):
         error_msg = result.get("message", result.get("msg", "Unknown error"))
         log.error(f"Order failed: {error_msg}")
@@ -347,7 +300,7 @@ def telegram_polling():
                         send_telegram(f"⚠️ Balance error: {str(e)[:100]}")
                 elif text == "/price":
                     try:
-                        p = get_price("BTCUSDTPERP")
+                        p = get_price("B-BTC_USDT")
                         send_telegram(f"₿ BTC Futures: <b>${p:,.2f}</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Price error: {str(e)[:100]}")
@@ -390,66 +343,48 @@ def home():
         "tg_chat"     : "SET ✅" if os.environ.get("TELEGRAM_CHAT_ID")   else "MISSING ❌",
     })
 
-@app.route("/health",        methods=["GET"])
-def health():       return jsonify({"status": "ok", "active": BOT_ACTIVE})
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "active": BOT_ACTIVE})
 
 @app.route("/test_telegram", methods=["GET"])
-def test_tg():      return jsonify({"sent": send_telegram("🧪 CoinDCX Futures Bot Test!")})
+def test_tg():
+    return jsonify({"sent": send_telegram("🧪 CoinDCX Futures Bot Test!")})
 
-@app.route("/test_balance",  methods=["GET"])
-def test_balance(): return jsonify({"balance": get_balance()})
+@app.route("/test_balance", methods=["GET"])
+def test_balance():
+    return jsonify({"balance": get_balance()})
 
-@app.route("/test_price",    methods=["GET"])
+@app.route("/test_price", methods=["GET"])
 def test_price():
-    try:    return jsonify({"price": get_price("BTCUSDTPERP")})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    try:
+        return jsonify({"price": get_price("B-BTC_USDT")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    results = {}
-    # Test all possible futures ticker endpoints
-    ticker_endpoints = [
-        "/exchange/v1/derivatives/futures/data/ticker",
-        "/exchange/v1/derivatives/futures/data/active_instruments",
-        "/exchange/v1/derivatives/futures/data/market_data",
-        "/derivatives/api/v1/ticker",
-        "/exchange/ticker",
-    ]
-    for ep in ticker_endpoints:
-        try:
-            r = requests.get(f"{BASE_URL}{ep}", timeout=5)
-            results[f"ticker_{ep}"] = {
-                "status": r.status_code,
-                "sample": str(r.text[:300])
-            }
-        except Exception as e:
-            results[f"ticker_{ep}"] = {"error": str(e)}
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+        tickers = r.json()
+        btc_futures = [t for t in tickers if "B-BTC" in t.get("market", "")]
 
-    # Test all possible balance endpoints
-    payload = {"timestamp": int(time.time() * 1000)}
-    body = json.dumps(payload, separators=(",", ":"))
-    balance_endpoints = [
-        "/exchange/v1/derivatives/futures/user/balances",
-        "/exchange/v1/derivatives/futures/user/portfolio",
-        "/exchange/v1/derivatives/futures/account/balances",
-        "/exchange/v1/users/balances",
-        "/exchange/v1/margin/balances",
-    ]
-    for ep in balance_endpoints:
-        try:
-            rb = requests.post(
-                f"{BASE_URL}{ep}",
-                headers=make_headers(body),
-                data=body, timeout=5
-            )
-            results[f"balance_{ep}"] = {
-                "status": rb.status_code,
-                "sample": str(rb.text[:300])
-            }
-        except Exception as e:
-            results[f"balance_{ep}"] = {"error": str(e)}
+        payload = {"timestamp": int(time.time() * 1000)}
+        body = json.dumps(payload, separators=(",", ":"))
+        rb = requests.post(
+            f"{BASE_URL}/exchange/v1/users/balances",
+            headers=make_headers(body), data=body, timeout=10
+        )
+        bal_data = rb.json()
+        usdt = next((a for a in bal_data if a.get("currency", "").upper() == "USDT"), None)
 
-    return jsonify(results)
+        return jsonify({
+            "btc_futures_ticker" : btc_futures,
+            "usdt_balance"       : usdt
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 50)
