@@ -1,6 +1,6 @@
 """
 COINDCX FUTURES TRADING BOT + TELEGRAM
-Fixed: correct symbol format B-BTC_USDT, correct balance endpoint
+INR Margin version - Fixed endpoints and symbol format
 """
 import hashlib
 import hmac
@@ -15,22 +15,31 @@ import requests
 from flask import Flask, request, jsonify
 
 # ─── BOT SETTINGS ────────────────────────────────────────────────────────────
-BASE_URL   = "https://api.coindcx.com"
-SL_PERC    = 0.007
-RR         = 1.8
-LEVERAGE   = 10
-RISK_PERC  = 0.10
-BOT_ACTIVE = True
+BASE_URL        = "https://api.coindcx.com"
+SL_PERC         = 0.007
+RR              = 1.8
+LEVERAGE        = 10
+RISK_PERC       = 0.10
+BOT_ACTIVE      = True
+MARGIN_CURRENCY = "INR"
 
 # ─── SYMBOL FORMAT ───────────────────────────────────────────────────────────
 def to_futures_symbol(symbol: str) -> str:
-    # BTCUSDT → B-BTC_USDT
+    """
+    BTCUSDT  → B-BTC_INR
+    BTCINR   → B-BTC_INR
+    ETHINR   → B-ETH_INR
+    ETHUSDT  → B-ETH_INR
+    """
     symbol = symbol.upper().replace("-", "").replace("_", "")
-    for quote in ["USDT", "INR", "BTC", "ETH"]:
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"B-{base}_INR"
+    for quote in ["INR", "BTC", "ETH"]:
         if symbol.endswith(quote):
             base = symbol[: -len(quote)]
             return f"B-{base}_{quote}"
-    return symbol
+    return f"B-{symbol}_INR"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -93,9 +102,11 @@ def get_balance() -> float:
         data = r.json()
         if isinstance(data, list):
             for asset in data:
-                if asset.get("currency", "").upper() == "USDT":
-                    return float(asset.get("balance", 0))
-        log.error(f"USDT not found in balance: {data}")
+                if asset.get("currency", "").upper() == "INR":
+                    bal = float(asset.get("balance", 0))
+                    log.info(f"INR balance: ₹{bal}")
+                    return bal
+        log.error(f"INR not found in balance: {data}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance error: {e}")
@@ -103,14 +114,20 @@ def get_balance() -> float:
 
 
 def get_price(symbol: str) -> float:
-    # symbol = B-BTC_USDT
+    """
+    Uses /exchange/ticker (public endpoint).
+    symbol = B-BTC_INR
+    """
     try:
         r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+        log.info(f"Ticker status: {r.status_code}")
         tickers = r.json()
         if isinstance(tickers, list):
             for t in tickers:
                 if t.get("market", "").upper() == symbol.upper():
-                    return float(t["last_price"])
+                    price = float(t["last_price"])
+                    log.info(f"Price {symbol}: ₹{price}")
+                    return price
         raise ValueError(f"Symbol {symbol} not found in ticker")
     except Exception as e:
         log.error(f"get_price error: {e}")
@@ -180,13 +197,13 @@ def execute_trade(symbol: str, action: str) -> dict:
     if not BOT_ACTIVE:
         return {"status": "blocked", "reason": "Bot stopped"}
 
-    futures_symbol = to_futures_symbol(symbol)    # BTCUSDT → B-BTC_USDT
+    futures_symbol = to_futures_symbol(symbol)    # BTCUSDT → B-BTC_INR
     price          = get_price(futures_symbol)
     balance        = get_balance()
-    log.info(f"Trade: {action} {futures_symbol} price={price} balance={balance}")
+    log.info(f"Trade: {action} {futures_symbol} price=₹{price} balance=₹{balance}")
 
-    if balance < 1:
-        raise ValueError(f"Balance too low: ${balance:.2f}")
+    if balance < 10:
+        raise ValueError(f"Balance too low: ₹{balance:.2f}")
 
     qty = round((balance * RISK_PERC * LEVERAGE) / price, 4)
     if qty <= 0:
@@ -218,15 +235,15 @@ def execute_trade(symbol: str, action: str) -> dict:
     send_telegram(
         f"{emoji} <b>{futures_symbol}</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"💰 Price:    <b>${price:,.2f}</b>\n"
+        f"💰 Price:    <b>₹{price:,.2f}</b>\n"
         f"📦 Qty:      <b>{qty:.4f}</b>\n"
-        f"🎯 TP:       <b>${tp:,.2f}</b>\n"
-        f"🛑 SL:       <b>${sl:,.2f}</b>\n"
+        f"🎯 TP:       <b>₹{tp:,.2f}</b>\n"
+        f"🛑 SL:       <b>₹{sl:,.2f}</b>\n"
         f"⚡ Leverage: <b>{LEVERAGE}x</b>\n"
-        f"💼 Balance:  <b>${balance:,.2f} USDT</b>\n"
+        f"💼 Balance:  <b>₹{balance:,.2f} INR</b>\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
-    log.info(f"✅ Trade done: {side} {qty} {futures_symbol} @ {price}")
+    log.info(f"✅ Trade done: {side} {qty} {futures_symbol} @ ₹{price}")
     return result
 
 # ─── TELEGRAM POLLING ────────────────────────────────────────────────────────
@@ -236,6 +253,7 @@ def telegram_polling():
     log.info("🤖 Telegram polling started!")
     send_telegram(
         "🚀 <b>CoinDCX Futures Bot ONLINE!</b>\n"
+        f"💱 Margin: INR\n"
         f"SL: {SL_PERC*100}% | TP: {SL_PERC*RR*100:.2f}%\n"
         f"Leverage: {LEVERAGE}x | Risk: {RISK_PERC*100:.0f}%\n"
         "Send /help to see commands"
@@ -270,11 +288,11 @@ def telegram_polling():
                     send_telegram("🔴 <b>Bot STOPPED!</b> Send /start to resume.")
                 elif text == "/help":
                     send_telegram(
-                        "🤖 <b>CoinDCX Futures Bot</b>\n"
+                        "🤖 <b>CoinDCX Futures Bot (INR)</b>\n"
                         "━━━━━━━━━━━━━━\n"
                         "/status  — Bot status\n"
-                        "/balance — Futures USDT balance\n"
-                        "/price   — BTC futures price\n"
+                        "/balance — INR balance\n"
+                        "/price   — BTC/INR price\n"
                         "/stop    — Stop trading\n"
                         "/start   — Start trading\n"
                         "/help    — This menu"
@@ -286,7 +304,7 @@ def telegram_polling():
                             f"🤖 <b>Futures Bot Status</b>\n"
                             f"━━━━━━━━━━━━\n"
                             f"{'🟢 RUNNING' if BOT_ACTIVE else '🔴 STOPPED'}\n"
-                            f"Balance:  <b>${bal:,.2f} USDT</b>\n"
+                            f"Balance:  <b>₹{bal:,.2f} INR</b>\n"
                             f"Leverage: <b>{LEVERAGE}x</b>\n"
                             f"Risk:     <b>{RISK_PERC*100:.0f}%/trade</b>"
                         )
@@ -295,13 +313,13 @@ def telegram_polling():
                 elif text == "/balance":
                     try:
                         bal = get_balance()
-                        send_telegram(f"💼 Futures Balance: <b>${bal:,.2f} USDT</b>")
+                        send_telegram(f"💼 INR Balance: <b>₹{bal:,.2f}</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Balance error: {str(e)[:100]}")
                 elif text == "/price":
                     try:
-                        p = get_price("B-BTC_USDT")
-                        send_telegram(f"₿ BTC Futures: <b>${p:,.2f}</b>")
+                        p = get_price("B-BTC_INR")
+                        send_telegram(f"₿ BTC/INR Futures: <b>₹{p:,.2f}</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Price error: {str(e)[:100]}")
         except Exception as e:
@@ -336,8 +354,9 @@ def webhook():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status"      : "CoinDCX Futures Bot 🚀",
+        "status"      : "CoinDCX Futures Bot (INR) 🚀",
         "bot_active"  : BOT_ACTIVE,
+        "margin"      : MARGIN_CURRENCY,
         "coindcx_key" : "SET ✅" if os.environ.get("COINDCX_API_KEY")    else "MISSING ❌",
         "tg_token"    : "SET ✅" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING ❌",
         "tg_chat"     : "SET ✅" if os.environ.get("TELEGRAM_CHAT_ID")   else "MISSING ❌",
@@ -349,38 +368,43 @@ def health():
 
 @app.route("/test_telegram", methods=["GET"])
 def test_tg():
-    return jsonify({"sent": send_telegram("🧪 CoinDCX Futures Bot Test!")})
+    return jsonify({"sent": send_telegram("🧪 CoinDCX Futures INR Bot Test!")})
 
 @app.route("/test_balance", methods=["GET"])
 def test_balance():
-    return jsonify({"balance": get_balance()})
+    bal = get_balance()
+    return jsonify({"INR_balance": bal})
 
 @app.route("/test_price", methods=["GET"])
 def test_price():
     try:
-        return jsonify({"price": get_price("B-BTC_USDT")})
+        p = get_price("B-BTC_INR")
+        return jsonify({"BTC_INR_price": p})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/debug", methods=["GET"])
 def debug():
     try:
+        # Check B-BTC_INR in ticker
         r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
         tickers = r.json()
-        btc_futures = [t for t in tickers if "B-BTC" in t.get("market", "")]
+        btc_inr = [t for t in tickers if "B-BTC" in t.get("market", "")]
 
+        # Check INR balance
         payload = {"timestamp": int(time.time() * 1000)}
-        body = json.dumps(payload, separators=(",", ":"))
+        body    = json.dumps(payload, separators=(",", ":"))
         rb = requests.post(
             f"{BASE_URL}/exchange/v1/users/balances",
             headers=make_headers(body), data=body, timeout=10
         )
         bal_data = rb.json()
-        usdt = next((a for a in bal_data if a.get("currency", "").upper() == "USDT"), None)
-
+        inr_bal  = next(
+            (a for a in bal_data if a.get("currency", "").upper() == "INR"), None
+        )
         return jsonify({
-            "btc_futures_ticker" : btc_futures,
-            "usdt_balance"       : usdt
+            "btc_inr_ticker" : btc_inr,
+            "inr_balance"    : inr_bal
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -388,7 +412,7 @@ def debug():
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("COINDCX FUTURES BOT STARTING 🚀")
+    log.info("COINDCX FUTURES BOT (INR) STARTING 🚀")
     log.info(f"COINDCX_API_KEY:    {'SET ✅' if os.environ.get('COINDCX_API_KEY')    else 'MISSING ❌'}")
     log.info(f"COINDCX_SECRET_KEY: {'SET ✅' if os.environ.get('COINDCX_SECRET_KEY') else 'MISSING ❌'}")
     log.info(f"TELEGRAM_BOT_TOKEN: {'SET ✅' if os.environ.get('TELEGRAM_BOT_TOKEN') else 'MISSING ❌'}")
