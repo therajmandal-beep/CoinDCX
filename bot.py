@@ -1,6 +1,6 @@
 """
 COINDCX FUTURES TRADING BOT + TELEGRAM
-INR Margin version - Fixed endpoints and symbol format
+INR Margin | USDT Futures Pairs | 23x Leverage
 """
 import hashlib
 import hmac
@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 BASE_URL        = "https://api.coindcx.com"
 SL_PERC         = 0.007
 RR              = 1.8
-LEVERAGE        = 10
+LEVERAGE        = 23
 RISK_PERC       = 0.10
 BOT_ACTIVE      = True
 MARGIN_CURRENCY = "INR"
@@ -26,20 +26,18 @@ MARGIN_CURRENCY = "INR"
 # ─── SYMBOL FORMAT ───────────────────────────────────────────────────────────
 def to_futures_symbol(symbol: str) -> str:
     """
-    BTCUSDT  → B-BTC_INR
-    BTCINR   → B-BTC_INR
-    ETHINR   → B-ETH_INR
-    ETHUSDT  → B-ETH_INR
+    Always returns USDT futures pair (CoinDCX futures use USDT pairs)
+    BTCUSDT → B-BTC_USDT
+    BTCINR  → B-BTC_USDT
+    ETHINR  → B-ETH_USDT
+    ETHUSDT → B-ETH_USDT
     """
     symbol = symbol.upper().replace("-", "").replace("_", "")
-    if symbol.endswith("USDT"):
-        base = symbol[:-4]
-        return f"B-{base}_INR"
-    for quote in ["INR", "BTC", "ETH"]:
+    for quote in ["USDT", "INR", "BTC", "ETH"]:
         if symbol.endswith(quote):
             base = symbol[: -len(quote)]
-            return f"B-{base}_{quote}"
-    return f"B-{symbol}_INR"
+            return f"B-{base}_USDT"
+    return f"B-{symbol}_USDT"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -115,20 +113,40 @@ def get_balance() -> float:
 
 def get_price(symbol: str) -> float:
     """
-    Uses /exchange/ticker (public endpoint).
-    symbol = B-BTC_INR
+    Tries multiple endpoints to get futures price.
+    symbol = B-BTC_USDT
     """
     try:
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        log.info(f"Ticker status: {r.status_code}")
-        tickers = r.json()
-        if isinstance(tickers, list):
-            for t in tickers:
-                if t.get("market", "").upper() == symbol.upper():
-                    price = float(t["last_price"])
-                    log.info(f"Price {symbol}: ₹{price}")
-                    return price
-        raise ValueError(f"Symbol {symbol} not found in ticker")
+        # Try futures orderbook first
+        r = requests.get(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/data/orderbook",
+            params={"symbol": symbol},
+            timeout=10
+        )
+        log.info(f"Orderbook {symbol}: {r.status_code} {r.text[:300]}")
+        if r.status_code == 200:
+            data = r.json()
+            for field in ["last_price", "lastPrice", "last", "close", "ltp"]:
+                val = data.get(field)
+                if val:
+                    return float(val)
+            # Try asks array for price
+            asks = data.get("asks", [])
+            if asks:
+                first = asks[0]
+                if isinstance(first, list):
+                    return float(first[0])
+                if isinstance(first, dict):
+                    return float(first.get("price", first.get("rate", 0)))
+
+        # Fallback: spot ticker
+        r2 = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+        log.info(f"Spot ticker fallback status: {r2.status_code}")
+        for t in r2.json():
+            if t.get("market", "").upper() == symbol.upper():
+                return float(t["last_price"])
+
+        raise ValueError(f"Price not found for {symbol}")
     except Exception as e:
         log.error(f"get_price error: {e}")
         raise
@@ -197,7 +215,7 @@ def execute_trade(symbol: str, action: str) -> dict:
     if not BOT_ACTIVE:
         return {"status": "blocked", "reason": "Bot stopped"}
 
-    futures_symbol = to_futures_symbol(symbol)    # BTCUSDT → B-BTC_INR
+    futures_symbol = to_futures_symbol(symbol)
     price          = get_price(futures_symbol)
     balance        = get_balance()
     log.info(f"Trade: {action} {futures_symbol} price=₹{price} balance=₹{balance}")
@@ -292,7 +310,7 @@ def telegram_polling():
                         "━━━━━━━━━━━━━━\n"
                         "/status  — Bot status\n"
                         "/balance — INR balance\n"
-                        "/price   — BTC/INR price\n"
+                        "/price   — BTC futures price\n"
                         "/stop    — Stop trading\n"
                         "/start   — Start trading\n"
                         "/help    — This menu"
@@ -318,8 +336,8 @@ def telegram_polling():
                         send_telegram(f"⚠️ Balance error: {str(e)[:100]}")
                 elif text == "/price":
                     try:
-                        p = get_price("B-BTC_INR")
-                        send_telegram(f"₿ BTC/INR Futures: <b>₹{p:,.2f}</b>")
+                        p = get_price("B-BTC_USDT")
+                        send_telegram(f"₿ BTC Futures: <b>₹{p:,.2f}</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Price error: {str(e)[:100]}")
         except Exception as e:
@@ -356,6 +374,8 @@ def home():
     return jsonify({
         "status"      : "CoinDCX Futures Bot (INR) 🚀",
         "bot_active"  : BOT_ACTIVE,
+        "leverage"    : LEVERAGE,
+        "risk"        : f"{RISK_PERC*100:.0f}%",
         "margin"      : MARGIN_CURRENCY,
         "coindcx_key" : "SET ✅" if os.environ.get("COINDCX_API_KEY")    else "MISSING ❌",
         "tg_token"    : "SET ✅" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING ❌",
@@ -378,34 +398,48 @@ def test_balance():
 @app.route("/test_price", methods=["GET"])
 def test_price():
     try:
-        p = get_price("B-BTC_INR")
-        return jsonify({"BTC_INR_price": p})
+        p = get_price("B-BTC_USDT")
+        return jsonify({"BTC_USDT_futures_price": p})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/debug", methods=["GET"])
 def debug():
     try:
-        # Check B-BTC_INR in ticker
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        tickers = r.json()
-        btc_inr = [t for t in tickers if "B-BTC" in t.get("market", "")]
+        results = {}
 
-        # Check INR balance
+        # Check active futures instruments
+        r1 = requests.get(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/data/active_instruments",
+            timeout=10
+        )
+        instruments = r1.json() if r1.status_code == 200 else []
+        results["btc_instruments"] = [i for i in instruments if "BTC" in str(i)]
+
+        # Try orderbook for B-BTC_USDT
+        r2 = requests.get(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/data/orderbook",
+            params={"symbol": "B-BTC_USDT"},
+            timeout=10
+        )
+        results["orderbook"] = {
+            "status" : r2.status_code,
+            "sample" : r2.text[:400]
+        }
+
+        # INR balance
         payload = {"timestamp": int(time.time() * 1000)}
         body    = json.dumps(payload, separators=(",", ":"))
         rb = requests.post(
             f"{BASE_URL}/exchange/v1/users/balances",
             headers=make_headers(body), data=body, timeout=10
         )
-        bal_data = rb.json()
-        inr_bal  = next(
-            (a for a in bal_data if a.get("currency", "").upper() == "INR"), None
+        inr = next(
+            (a for a in rb.json() if a.get("currency", "").upper() == "INR"), None
         )
-        return jsonify({
-            "btc_inr_ticker" : btc_inr,
-            "inr_balance"    : inr_bal
-        })
+        results["inr_balance"] = inr
+
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -413,6 +447,8 @@ def debug():
 if __name__ == "__main__":
     log.info("=" * 50)
     log.info("COINDCX FUTURES BOT (INR) STARTING 🚀")
+    log.info(f"LEVERAGE:           {LEVERAGE}x")
+    log.info(f"RISK PER TRADE:     {RISK_PERC*100:.0f}%")
     log.info(f"COINDCX_API_KEY:    {'SET ✅' if os.environ.get('COINDCX_API_KEY')    else 'MISSING ❌'}")
     log.info(f"COINDCX_SECRET_KEY: {'SET ✅' if os.environ.get('COINDCX_SECRET_KEY') else 'MISSING ❌'}")
     log.info(f"TELEGRAM_BOT_TOKEN: {'SET ✅' if os.environ.get('TELEGRAM_BOT_TOKEN') else 'MISSING ❌'}")
