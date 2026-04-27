@@ -406,34 +406,50 @@ def test_price():
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    try:
-        # Check all available futures markets
-        r = requests.get(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/data/ticker",
-            timeout=10
-        )
-        tickers = r.json()
-        btc_markets = []
-        if isinstance(tickers, list):
-            btc_markets = [t for t in tickers if "BTC" in str(t.get("market", t.get("symbol", "")))]
-        elif isinstance(tickers, dict):
-            data = tickers.get("data", [])
-            if isinstance(data, list):
-                btc_markets = [t for t in data if "BTC" in str(t.get("market", t.get("symbol", "")))]
-        # Check raw balance
-        payload = {"timestamp": int(time.time() * 1000)}
-        body = json.dumps(payload, separators=(",", ":"))
-        rb = requests.post(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/user/balances",
-            headers=make_headers(body), data=body, timeout=10
-        )
-        return jsonify({
-            "btc_futures_markets" : btc_markets[:5],
-            "balance_raw"         : rb.json()
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    results = {}
+    # Test all possible futures ticker endpoints
+    ticker_endpoints = [
+        "/exchange/v1/derivatives/futures/data/ticker",
+        "/exchange/v1/derivatives/futures/data/active_instruments",
+        "/exchange/v1/derivatives/futures/data/market_data",
+        "/derivatives/api/v1/ticker",
+        "/exchange/ticker",
+    ]
+    for ep in ticker_endpoints:
+        try:
+            r = requests.get(f"{BASE_URL}{ep}", timeout=5)
+            results[f"ticker_{ep}"] = {
+                "status": r.status_code,
+                "sample": str(r.text[:300])
+            }
+        except Exception as e:
+            results[f"ticker_{ep}"] = {"error": str(e)}
 
+    # Test all possible balance endpoints
+    payload = {"timestamp": int(time.time() * 1000)}
+    body = json.dumps(payload, separators=(",", ":"))
+    balance_endpoints = [
+        "/exchange/v1/derivatives/futures/user/balances",
+        "/exchange/v1/derivatives/futures/user/portfolio",
+        "/exchange/v1/derivatives/futures/account/balances",
+        "/exchange/v1/users/balances",
+        "/exchange/v1/margin/balances",
+    ]
+    for ep in balance_endpoints:
+        try:
+            rb = requests.post(
+                f"{BASE_URL}{ep}",
+                headers=make_headers(body),
+                data=body, timeout=5
+            )
+            results[f"balance_{ep}"] = {
+                "status": rb.status_code,
+                "sample": str(rb.text[:300])
+            }
+        except Exception as e:
+            results[f"balance_{ep}"] = {"error": str(e)}
+
+    return jsonify(results)
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 50)
