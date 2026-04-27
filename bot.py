@@ -1,6 +1,6 @@
 """
-COINDCX AI TRADING BOT + TELEGRAM
-Adapted from Bitunix bot — uses HMAC-SHA256 auth, CoinDCX REST API
+COINDCX FUTURES TRADING BOT + TELEGRAM
+Uses CoinDCX Derivatives/Futures API
 """
 import hashlib
 import hmac
@@ -23,21 +23,14 @@ RISK_PERC  = 0.10
 BOT_ACTIVE = True
 
 # ─── SYMBOL FORMAT ───────────────────────────────────────────────────────────
-# CoinDCX futures symbol format: "B-BTC_USDT"
-# TradingView sends "BTCUSDT" → we convert
-def to_coindcx_symbol(symbol: str) -> str:
-    """
-    Convert 'BTCUSDT' → 'B-BTC_USDT' (CoinDCX futures format).
-    Handles most common USDT pairs.
-    For INR pairs: 'BTCINR' → 'B-BTC_INR'
-    Adjust the logic if you trade other pairs.
-    """
-    symbol = symbol.upper()
-    for quote in ["USDT", "INR", "BTC", "ETH", "BNB"]:
-        if symbol.endswith(quote):
-            base = symbol[: -len(quote)]
-            return f"B-{base}_{quote}"
-    return symbol  # fallback: return as-is
+# CoinDCX Futures symbol format: BTCUSDTPERP
+def to_futures_symbol(symbol: str) -> str:
+    symbol = symbol.upper().replace("-", "").replace("_", "")
+    if not symbol.endswith("PERP"):
+        symbol = symbol + "PERP"
+    return symbol
+# "BTCUSDT" → "BTCUSDTPERP"
+# "ETHUSDT" → "ETHUSDTPERP"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -47,9 +40,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── COINDCX SIGNATURE (HMAC-SHA256) ─────────────────────────────────────────
+# ─── SIGNATURE ───────────────────────────────────────────────────────────────
 def make_signature(body: str) -> str:
-    """CoinDCX: HMAC-SHA256(secret_key, request_body_as_string)"""
     secret = os.environ.get("COINDCX_SECRET_KEY", "")
     return hmac.new(
         secret.encode("utf-8"),
@@ -58,11 +50,10 @@ def make_signature(body: str) -> str:
     ).hexdigest()
 
 def make_headers(body: str = "") -> dict:
-    api_key = os.environ.get("COINDCX_API_KEY", "")
     return {
-        "X-AUTH-APIKEY"     : api_key,
-        "X-AUTH-SIGNATURE"  : make_signature(body),
-        "Content-Type"      : "application/json",
+        "X-AUTH-APIKEY"    : os.environ.get("COINDCX_API_KEY", ""),
+        "X-AUTH-SIGNATURE" : make_signature(body),
+        "Content-Type"     : "application/json",
     }
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
@@ -87,34 +78,40 @@ def send_telegram(message: str) -> bool:
         log.error(f"Telegram exception: {e}")
         return False
 
-# ─── COINDCX API ─────────────────────────────────────────────────────────────
+# ─── COINDCX FUTURES API ──────────────────────────────────────────────────────
 def get_balance() -> float:
     """
-    POST /exchange/v1/users/balances
-    Returns available USDT balance.
+    POST /exchange/v1/derivatives/futures/user/balances
+    Returns available USDT margin balance
     """
     try:
         payload = {"timestamp": int(time.time() * 1000)}
         body    = json.dumps(payload, separators=(",", ":"))
         r = requests.post(
-            f"{BASE_URL}/exchange/v1/users/balances",
+            f"{BASE_URL}/exchange/v1/derivatives/futures/user/balances",
             headers=make_headers(body),
             data=body,
             timeout=10
         )
-        log.info(f"Balance response: {r.status_code} {r.text[:300]}")
+        log.info(f"Balance RAW: {r.text}")
         data = r.json()
-        # data is a list of balance objects
+        # Try list format
         if isinstance(data, list):
             for asset in data:
-                if asset.get("currency_short_name", "").upper() == "USDT":
-                    return float(asset.get("balance", 0))
-        # Some accounts may return a dict with 'balances' key
+                currency = asset.get("currency_short_name", "").upper()
+                if currency == "USDT":
+                    for field in ["available_balance", "balance", "available", "free"]:
+                        val = asset.get(field)
+                        if val is not None:
+                            return float(val)
+        # Try dict format
         if isinstance(data, dict):
-            for asset in data.get("balances", []):
-                if asset.get("currency_short_name", "").upper() == "USDT":
-                    return float(asset.get("balance", 0))
-        log.error(f"USDT balance not found in: {data}")
+            balance_data = data.get("data", data)
+            for field in ["available_balance", "balance", "available", "free", "usdt_balance"]:
+                val = balance_data.get(field)
+                if val is not None:
+                    return float(val)
+        log.error(f"Balance not found: {data}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance error: {e}")
@@ -123,18 +120,36 @@ def get_balance() -> float:
 
 def get_price(symbol: str) -> float:
     """
-    GET /exchange/ticker  (public, no auth needed)
-    CoinDCX returns a list; match on 'market' field.
-    symbol should be CoinDCX format e.g. 'B-BTC_USDT'
+    GET /exchange/v1/derivatives/futures/data/ticker
+    symbol = BTCUSDTPERP
     """
     try:
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        log.info(f"Price response: {r.status_code}")
+        r = requests.get(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/data/ticker",
+            timeout=10
+        )
+        log.info(f"Ticker status: {r.status_code}")
         tickers = r.json()
-        for t in tickers:
-            if t.get("market", "").upper() == symbol.upper():
-                return float(t["last_price"])
-        raise ValueError(f"No ticker found for {symbol}")
+        # tickers can be list or dict
+        if isinstance(tickers, list):
+            for t in tickers:
+                mkt = t.get("market", t.get("symbol", "")).upper()
+                if mkt == symbol.upper():
+                    for field in ["last_price", "lastPrice", "last", "close"]:
+                        val = t.get(field)
+                        if val:
+                            return float(val)
+        if isinstance(tickers, dict):
+            data = tickers.get("data", tickers)
+            if isinstance(data, list):
+                for t in data:
+                    mkt = t.get("market", t.get("symbol", "")).upper()
+                    if mkt == symbol.upper():
+                        for field in ["last_price", "lastPrice", "last", "close"]:
+                            val = t.get(field)
+                            if val:
+                                return float(val)
+        raise ValueError(f"No futures ticker for {symbol}")
     except Exception as e:
         log.error(f"get_price error: {e}")
         raise
@@ -142,19 +157,17 @@ def get_price(symbol: str) -> float:
 
 def set_leverage(symbol: str, leverage: int):
     """
-    POST /exchange/v1/margin/settings
-    Sets leverage for a margin/futures pair.
-    ⚠️ Verify exact endpoint & fields with CoinDCX docs for your account type.
+    POST /exchange/v1/derivatives/futures/user/leverage
     """
     try:
         payload = {
             "symbol"    : symbol,
-            "leverage"  : leverage,
+            "leverage"  : str(leverage),
             "timestamp" : int(time.time() * 1000),
         }
         body = json.dumps(payload, separators=(",", ":"))
         r = requests.post(
-            f"{BASE_URL}/exchange/v1/margin/settings",
+            f"{BASE_URL}/exchange/v1/derivatives/futures/user/leverage",
             headers=make_headers(body),
             data=body,
             timeout=10
@@ -166,32 +179,25 @@ def set_leverage(symbol: str, leverage: int):
 
 def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
     """
-    POST /exchange/v1/orders/create
+    POST /exchange/v1/derivatives/futures/orders/create
     side = 'buy' or 'sell'
-
-    For futures/margin accounts CoinDCX supports:
-      - take_profit_price
-      - stop_loss_price
-      - leverage
-
-    ⚠️ If you're on a SPOT account, remove leverage/tp/sl fields.
-    ⚠️ Verify field names against your CoinDCX account tier docs.
+    order_type = 'market_order'
     """
     payload = {
         "market"            : symbol,
         "order_type"        : "market_order",
-        "side"              : side.lower(),     # "buy" or "sell"
-        "total_quantity"    : round(qty, 6),
+        "side"              : side.lower(),
+        "quantity"          : round(qty, 6),
         "leverage"          : LEVERAGE,
-        "take_profit_price" : round(tp, 2),
-        "stop_loss_price"   : round(sl, 2),
+        "take_profit_price" : str(round(tp, 2)),
+        "stop_loss_price"   : str(round(sl, 2)),
         "client_order_id"   : uuid.uuid4().hex,
         "timestamp"         : int(time.time() * 1000),
     }
     body = json.dumps(payload, separators=(",", ":"))
-    log.info(f"Placing order: {body}")
+    log.info(f"Placing futures order: {body}")
     r = requests.post(
-        f"{BASE_URL}/exchange/v1/orders/create",
+        f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create",
         headers=make_headers(body),
         data=body,
         timeout=10
@@ -217,14 +223,13 @@ def is_duplicate(symbol: str, action: str) -> bool:
 def execute_trade(symbol: str, action: str) -> dict:
     global BOT_ACTIVE
     action = action.lower()
-
     if not BOT_ACTIVE:
         return {"status": "blocked", "reason": "Bot stopped"}
 
-    cdx_symbol = to_coindcx_symbol(symbol)   # e.g. "B-BTC_USDT"
-    price      = get_price(cdx_symbol)
-    balance    = get_balance()
-    log.info(f"Trade: {action} {cdx_symbol} price={price} balance={balance}")
+    futures_symbol = to_futures_symbol(symbol)   # BTCUSDT → BTCUSDTPERP
+    price          = get_price(futures_symbol)
+    balance        = get_balance()
+    log.info(f"Trade: {action} {futures_symbol} price={price} balance={balance}")
 
     if balance < 1:
         raise ValueError(f"Balance too low: ${balance:.2f}")
@@ -242,32 +247,33 @@ def execute_trade(symbol: str, action: str) -> dict:
         sl   = round(price * (1 + SL_PERC), 2)
         tp   = round(price * (1 - SL_PERC * RR), 2)
 
-    set_leverage(cdx_symbol, LEVERAGE)
-    result = place_order(cdx_symbol, side, qty, tp, sl)
+    set_leverage(futures_symbol, LEVERAGE)
+    result = place_order(futures_symbol, side, qty, tp, sl)
 
-    # CoinDCX success: result has 'orders' list or 'id'
-    if result.get("code") and result["code"] != 200:
-        error_msg = result.get("message", "Unknown error")
+    # Check for error
+    if isinstance(result, dict) and result.get("code") not in (None, 0, 200, "200"):
+        error_msg = result.get("message", result.get("msg", "Unknown error"))
         log.error(f"Order failed: {error_msg}")
         send_telegram(
             f"❌ <b>Order Failed</b>\n"
-            f"{cdx_symbol} {side.upper()}\n"
+            f"{futures_symbol} {side.upper()}\n"
             f"Error: {error_msg}"
         )
         return result
 
-    emoji = "🟢 BUY" if action == "buy" else "🔴 SELL"
+    emoji = "🟢 LONG" if action == "buy" else "🔴 SHORT"
     send_telegram(
-        f"{emoji} <b>{cdx_symbol}</b>\n"
+        f"{emoji} <b>{futures_symbol}</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"💰 Price:   <b>₹{price:,.2f}</b>\n"
-        f"📦 Qty:     <b>{qty:.4f}</b>\n"
-        f"🎯 TP:      <b>₹{tp:,.2f}</b>\n"
-        f"🛑 SL:      <b>₹{sl:,.2f}</b>\n"
-        f"💼 Balance: <b>${balance:,.2f} USDT</b>\n"
+        f"💰 Price:    <b>${price:,.2f}</b>\n"
+        f"📦 Qty:      <b>{qty:.4f}</b>\n"
+        f"🎯 TP:       <b>${tp:,.2f}</b>\n"
+        f"🛑 SL:       <b>${sl:,.2f}</b>\n"
+        f"⚡ Leverage: <b>{LEVERAGE}x</b>\n"
+        f"💼 Balance:  <b>${balance:,.2f} USDT</b>\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
-    log.info(f"✅ Trade done: {side} {qty} {cdx_symbol} @ {price}")
+    log.info(f"✅ Trade done: {side} {qty} {futures_symbol} @ {price}")
     return result
 
 # ─── TELEGRAM POLLING ────────────────────────────────────────────────────────
@@ -276,10 +282,10 @@ def telegram_polling():
     offset = 0
     log.info("🤖 Telegram polling started!")
     send_telegram(
-        "🚀 <b>CoinDCX Bot is ONLINE!</b>\n"
+        "🚀 <b>CoinDCX Futures Bot ONLINE!</b>\n"
         f"SL: {SL_PERC*100}% | TP: {SL_PERC*RR*100:.2f}%\n"
         f"Leverage: {LEVERAGE}x | Risk: {RISK_PERC*100:.0f}%\n"
-        "Send /help to see all commands"
+        "Send /help to see commands"
     )
     while True:
         try:
@@ -305,17 +311,17 @@ def telegram_polling():
                     continue
                 if text in ("/start", "start"):
                     BOT_ACTIVE = True
-                    send_telegram("🟢 <b>Bot STARTED!</b> Ready to trade.")
+                    send_telegram("🟢 <b>Bot STARTED!</b> Ready to trade futures.")
                 elif text == "/stop":
                     BOT_ACTIVE = False
                     send_telegram("🔴 <b>Bot STOPPED!</b> Send /start to resume.")
                 elif text == "/help":
                     send_telegram(
-                        "🤖 <b>CoinDCX Bot Commands</b>\n"
+                        "🤖 <b>CoinDCX Futures Bot</b>\n"
                         "━━━━━━━━━━━━━━\n"
                         "/status  — Bot status\n"
-                        "/balance — USDT balance\n"
-                        "/price   — BTC price\n"
+                        "/balance — Futures USDT balance\n"
+                        "/price   — BTC futures price\n"
                         "/stop    — Stop trading\n"
                         "/start   — Start trading\n"
                         "/help    — This menu"
@@ -324,25 +330,25 @@ def telegram_polling():
                     try:
                         bal = get_balance()
                         send_telegram(
-                            f"🤖 <b>Bot Status</b>\n"
+                            f"🤖 <b>Futures Bot Status</b>\n"
                             f"━━━━━━━━━━━━\n"
                             f"{'🟢 RUNNING' if BOT_ACTIVE else '🔴 STOPPED'}\n"
                             f"Balance:  <b>${bal:,.2f} USDT</b>\n"
-                            f"Leverage: {LEVERAGE}x\n"
-                            f"Risk:     {RISK_PERC*100:.0f}%/trade"
+                            f"Leverage: <b>{LEVERAGE}x</b>\n"
+                            f"Risk:     <b>{RISK_PERC*100:.0f}%/trade</b>"
                         )
                     except Exception as e:
                         send_telegram(f"⚠️ Status error: {str(e)[:100]}")
                 elif text == "/balance":
                     try:
                         bal = get_balance()
-                        send_telegram(f"💼 Balance: <b>${bal:,.2f} USDT</b>")
+                        send_telegram(f"💼 Futures Balance: <b>${bal:,.2f} USDT</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Balance error: {str(e)[:100]}")
                 elif text == "/price":
                     try:
-                        p = get_price("B-BTC_USDT")
-                        send_telegram(f"₿ BTC/USDT: <b>₹{p:,.2f}</b>")
+                        p = get_price("BTCUSDTPERP")
+                        send_telegram(f"₿ BTC Futures: <b>${p:,.2f}</b>")
                     except Exception as e:
                         send_telegram(f"⚠️ Price error: {str(e)[:100]}")
         except Exception as e:
@@ -377,48 +383,66 @@ def webhook():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status"        : "CoinDCX Bot Running 🚀",
-        "bot_active"    : BOT_ACTIVE,
-        "coindcx_key"   : "SET ✅" if os.environ.get("COINDCX_API_KEY")    else "MISSING ❌",
-        "tg_token"      : "SET ✅" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING ❌",
-        "tg_chat"       : "SET ✅" if os.environ.get("TELEGRAM_CHAT_ID")   else "MISSING ❌",
+        "status"      : "CoinDCX Futures Bot 🚀",
+        "bot_active"  : BOT_ACTIVE,
+        "coindcx_key" : "SET ✅" if os.environ.get("COINDCX_API_KEY")    else "MISSING ❌",
+        "tg_token"    : "SET ✅" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING ❌",
+        "tg_chat"     : "SET ✅" if os.environ.get("TELEGRAM_CHAT_ID")   else "MISSING ❌",
     })
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "active": BOT_ACTIVE})
+@app.route("/health",        methods=["GET"])
+def health():       return jsonify({"status": "ok", "active": BOT_ACTIVE})
 
 @app.route("/test_telegram", methods=["GET"])
-def test_tg():
-    ok = send_telegram("🧪 Test from CoinDCX Bot!")
-    return jsonify({"sent": ok})
+def test_tg():      return jsonify({"sent": send_telegram("🧪 CoinDCX Futures Bot Test!")})
 
-@app.route("/test_balance", methods=["GET"])
-def test_balance():
-    bal = get_balance()
-    return jsonify({"balance": bal})
+@app.route("/test_balance",  methods=["GET"])
+def test_balance(): return jsonify({"balance": get_balance()})
 
-@app.route("/test_price", methods=["GET"])
+@app.route("/test_price",    methods=["GET"])
 def test_price():
+    try:    return jsonify({"price": get_price("BTCUSDTPERP")})
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+@app.route("/debug", methods=["GET"])
+def debug():
     try:
-        p = get_price("B-BTC_USDT")
-        return jsonify({"price": p})
+        # Check all available futures markets
+        r = requests.get(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/data/ticker",
+            timeout=10
+        )
+        tickers = r.json()
+        btc_markets = []
+        if isinstance(tickers, list):
+            btc_markets = [t for t in tickers if "BTC" in str(t.get("market", t.get("symbol", "")))]
+        elif isinstance(tickers, dict):
+            data = tickers.get("data", [])
+            if isinstance(data, list):
+                btc_markets = [t for t in data if "BTC" in str(t.get("market", t.get("symbol", "")))]
+        # Check raw balance
+        payload = {"timestamp": int(time.time() * 1000)}
+        body = json.dumps(payload, separators=(",", ":"))
+        rb = requests.post(
+            f"{BASE_URL}/exchange/v1/derivatives/futures/user/balances",
+            headers=make_headers(body), data=body, timeout=10
+        )
+        return jsonify({
+            "btc_futures_markets" : btc_markets[:5],
+            "balance_raw"         : rb.json()
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("COINDCX BOT STARTING 🚀")
+    log.info("COINDCX FUTURES BOT STARTING 🚀")
     log.info(f"COINDCX_API_KEY:    {'SET ✅' if os.environ.get('COINDCX_API_KEY')    else 'MISSING ❌'}")
     log.info(f"COINDCX_SECRET_KEY: {'SET ✅' if os.environ.get('COINDCX_SECRET_KEY') else 'MISSING ❌'}")
     log.info(f"TELEGRAM_BOT_TOKEN: {'SET ✅' if os.environ.get('TELEGRAM_BOT_TOKEN') else 'MISSING ❌'}")
     log.info(f"TELEGRAM_CHAT_ID:   {'SET ✅' if os.environ.get('TELEGRAM_CHAT_ID')   else 'MISSING ❌'}")
     log.info("=" * 50)
-
     threading.Thread(target=telegram_polling, daemon=True).start()
-    log.info("Telegram thread started!")
-
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-          
